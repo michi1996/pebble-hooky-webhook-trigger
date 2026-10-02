@@ -6,6 +6,7 @@ var KEY_UPDATE = 1;          // start of a settings sync
 var KEY_STATUS = 2;          // result of a webhook call
 var KEY_COUNT = 3;           // number of webhooks in this sync
 var KEY_ITEM_START = 4;      // index of the first webhook in an item batch
+var KEY_TRIGGER_ID = 5;      // id hash of the triggered webhook (sent by the watch)
 var KEY_AUTO_CLOSE = 30;
 var KEY_HEADER_COLOR = 31;
 var KEY_HIGHLIGHT_COLOR = 32;
@@ -16,6 +17,7 @@ var KEY_NAME_BASE = 100;     // + slot inside a batch
 var KEY_DESC_BASE = 200;     // + slot inside a batch
 var KEY_COLOR_BASE = 300;    // + slot inside a batch (RGB int, -1 = none)
 var KEY_FLAGS_BASE = 400;    // + slot inside a batch (bit 0 = ask before running)
+var KEY_ID_BASE = 500;       // + slot inside a batch (id hash, lets the watch trigger by id)
 
 var BATCH_SIZE = 6;          // must match ITEM_BATCH_SIZE in main.c
 var MAX_NAME_BYTES = 31;     // watch buffer: 32
@@ -24,6 +26,7 @@ var MAX_DESC_BYTES = 39;     // watch buffer: 40
 var DEFAULT_HEADER_COLOR = '#0055AA';
 var DEFAULT_HIGHLIGHT_COLOR = '#00FFFF';
 var METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'];
+var REQUEST_TIMEOUT_MS = 10000;
 
 var STORAGE_KEY = 'hooky-config';
 var LEGACY_KEY = 'clay-settings';   // settings of the old Clay based version (5 fixed webhooks)
@@ -47,6 +50,18 @@ function asColor(v, fallback) {
 }
 function colorToInt(hex) {
   return parseInt(hex.substr(1), 16);
+}
+
+// 32-bit FNV-1a hash of a webhook id as a signed int, never 0 (0 means "unknown" on the watch).
+// Written without Math.imul so it runs on every PebbleKit JS engine.
+function idHash(id) {
+  var s = asString(id);
+  var h = 0x811c9dc5;
+  for (var i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = (h + (h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24)) >>> 0;
+  }
+  return (h | 0) || 1;
 }
 
 // Cut a string so that its UTF-8 encoding fits into maxBytes.
@@ -208,6 +223,7 @@ function buildSyncMessages(cfg) {
       msg[KEY_DESC_BASE + slot] = (w.showDesc && w.desc) ? truncateUtf8(w.desc, MAX_DESC_BYTES) : '';
       msg[KEY_COLOR_BASE + slot] = w.color ? colorToInt(w.color) : -1;
       msg[KEY_FLAGS_BASE + slot] = w.confirm ? 1 : 0;
+      msg[KEY_ID_BASE + slot] = idHash(w.id);
     }
     messages.push(msg);
   }
@@ -240,7 +256,35 @@ function sendSettingsToWatch(cfg) {
 function sendStatus(code) {
   var msg = {};
   msg[KEY_STATUS] = code;
-  Pebble.sendAppMessage(msg, function () {}, function () {});
+  var attempts = 0;
+  function send() {
+    Pebble.sendAppMessage(msg, function () {}, function (e) {
+      attempts++;
+      console.log('Status message failed (attempt ' + attempts + '):', JSON.stringify(e));
+      if (attempts < 3) setTimeout(send, 400 * attempts);
+    });
+  }
+  send();
+}
+
+// Parses the string the config page returned. Depending on the phone app (Android / iOS)
+// it arrives URI-encoded or already decoded.
+function parseResponse(response) {
+  var text = asString(response);
+  if (!/^\s*\{/.test(text)) text = decodeURIComponent(text);
+  return JSON.parse(text);
+}
+
+// Finds the triggered webhook. The id is preferred over the position, because the list on the
+// watch can be older than the one on the phone (e.g. settings changed while the app was closed).
+function findWebhook(cfg, index, id) {
+  var byIndex = (index >= 1) ? cfg.webhooks[index - 1] : undefined;
+  if (!id) return byIndex || null;                // watch app without ids
+  if (byIndex && idHash(byIndex.id) === id) return byIndex;
+  for (var i = 0; i < cfg.webhooks.length; i++) {
+    if (idHash(cfg.webhooks[i].id) === id) return cfg.webhooks[i];
+  }
+  return null;
 }
 
 // --- Configuration page
@@ -254,7 +298,7 @@ Pebble.addEventListener('webviewclosed', function (e) {
     return;
   }
   try {
-    var cfg = sanitizeConfig(JSON.parse(decodeURIComponent(e.response)));
+    var cfg = sanitizeConfig(parseResponse(e.response));
     saveConfig(cfg);
     sendSettingsToWatch(cfg);
     console.log('Configuration saved, webhooks:', cfg.webhooks.length);
@@ -269,38 +313,34 @@ Pebble.addEventListener('ready', function () {
 });
 
 // --- AppMessage: receive trigger -> call webhook
-Pebble.addEventListener('appmessage', function (e) {
-  var trigger = null;
-  if (e && e.payload) {
-    if (typeof e.payload[KEY_TRIGGER] !== 'undefined') trigger = e.payload[KEY_TRIGGER];
-    else if (typeof e.payload.KEY_TRIGGER !== 'undefined') trigger = e.payload.KEY_TRIGGER;
-  }
-  if (trigger === null || typeof trigger === 'undefined') {
-    console.log('No trigger in payload');
-    return;
-  }
+function readPayload(payload, key, name) {
+  if (!payload) return undefined;
+  if (typeof payload[key] !== 'undefined') return payload[key];
+  if (typeof payload[name] !== 'undefined') return payload[name];
+  return undefined;
+}
 
-  var cfg = loadConfig();
-  var index = parseInt(trigger, 10);           // 1-based position in the list
-  var hook = cfg.webhooks[index - 1];
-  if (!index || !hook) {
-    console.log('Unknown webhook index:', trigger);
-    sendStatus(-2);                             // -2 = webhook not found
-    return;
-  }
-  if (!hook.url) {
-    console.log('Missing URL for webhook', index);
-    sendStatus(0);
-    return;
-  }
-
+function callWebhook(hook, index) {
   var method = hook.method || 'POST';
+  var finished = false;
+  var timer = null;
+  var xhr;
+
+  // Every request ends with exactly one status message to the watch
+  function finish(code, reason) {
+    if (finished) return;
+    finished = true;
+    if (timer) clearTimeout(timer);
+    console.log('Webhook ' + index + ' finished: ' + reason);
+    sendStatus(code);
+  }
+
   console.log('Triggering webhook', index, hook.name, method);
 
   try {
-    var xhr = new XMLHttpRequest();
+    xhr = new XMLHttpRequest();
     xhr.open(method, hook.url, true);
-    xhr.timeout = 10000;
+    try { xhr.timeout = REQUEST_TIMEOUT_MS; } catch (err) { /* not supported everywhere */ }
 
     // Custom headers
     var hasContentType = false;
@@ -334,25 +374,55 @@ Pebble.addEventListener('appmessage', function (e) {
       }
     }
 
-    xhr.onload = function () {
-      console.log('Webhook response status:', xhr.status);
-      // Treat every 2xx answer (200, 201, 204, ...) as success.
-      var code = (xhr.status >= 200 && xhr.status < 300) ? 200 : xhr.status;
-      sendStatus(code);
+    // Treat every 2xx answer (200, 201, 204, ...) as success.
+    var onDone = function () {
+      if (xhr.readyState !== 4 || !xhr.status) return;   // status 0 = network error, see onerror
+      finish((xhr.status >= 200 && xhr.status < 300) ? 200 : xhr.status, 'HTTP ' + xhr.status);
     };
-    xhr.onerror = function () {
-      console.log('XHR error:', xhr.status);
-      sendStatus(0);
-    };
-    xhr.ontimeout = function () {
-      console.log('XHR timeout');
-      sendStatus(-1);
-    };
+    xhr.onload = onDone;
+    xhr.onreadystatechange = onDone;   // for engines without onload
+    xhr.onerror = function () { finish(0, 'network error'); };
+    xhr.ontimeout = function () { finish(-1, 'timeout'); };
+
+    // Some engines ignore xhr.timeout: make sure the watch always gets an answer
+    timer = setTimeout(function () {
+      try { xhr.abort(); } catch (err) { /* ignore */ }
+      finish(-1, 'timeout (fallback)');
+    }, REQUEST_TIMEOUT_MS + 2000);
 
     if (body !== null) xhr.send(body);
     else xhr.send();
   } catch (err) {
     console.log('Error sending XHR:', err);
+    finish(0, 'exception');
+  }
+}
+
+Pebble.addEventListener('appmessage', function (e) {
+  var payload = e && e.payload;
+  var trigger = readPayload(payload, KEY_TRIGGER, 'KEY_TRIGGER');
+  if (trigger === null || typeof trigger === 'undefined') {
+    console.log('No trigger in payload');
+    return;
+  }
+
+  var cfg = loadConfig();
+  var index = parseInt(trigger, 10);           // 1-based position in the list
+  var id = parseInt(readPayload(payload, KEY_TRIGGER_ID, 'KEY_TRIGGER_ID'), 10) | 0;
+  var hook = findWebhook(cfg, index, id);
+
+  if (!hook) {
+    console.log('Unknown webhook:', trigger, id);
+    sendStatus(-2);                             // -2 = webhook not found
+  } else if (!hook.url) {
+    console.log('Missing URL for webhook', index);
     sendStatus(0);
+  } else {
+    callWebhook(hook, index);
+  }
+
+  // The watch shows an outdated list: send the current one
+  if (!hook || (id && cfg.webhooks[index - 1] !== hook)) {
+    sendSettingsToWatch(cfg);
   }
 });

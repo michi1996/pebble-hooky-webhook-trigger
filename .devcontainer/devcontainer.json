@@ -26,7 +26,7 @@
     },
     "codespaces": {
       "openFiles": [
-        "src/c/myfirstproject.c"
+        "src/c/main.c"
       ]
     }
   },
