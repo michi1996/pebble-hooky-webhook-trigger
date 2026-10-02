@@ -1,8 +1,6 @@
 {
     "author": "Achi",
-    "dependencies": {
-        "@rebble/clay": "^1.0.8"
-    },
+    "dependencies": {},
     "keywords": [
         "pebble-app"
     ],
@@ -13,13 +11,19 @@
         ],
         "displayName": "Hooky",
         "enableMultiJS": true,
-        "messageKeys": {
-            "KEY_AUTO_CLOSE": 30,
-            "KEY_TRIGGER": 0,
-            "clientid": 2,
-            "clientsecret": 3,
-            "webhook": 1
-        },
+        "messageKeys": [
+            "KEY_TRIGGER",
+            "KEY_UPDATE",
+            "KEY_STATUS",
+            "KEY_COUNT",
+            "KEY_ITEM_START",
+            "KEY_AUTO_CLOSE",
+            "KEY_SOUND_FEEDBACK",
+            "KEY_HEADER_COLOR",
+            "KEY_HIGHLIGHT_COLOR",
+            "KEY_DARK_LIST",
+            "KEY_TOUCH"
+        ],
         "projectType": "native",
         "resources": {
             "media": [
@@ -49,5 +53,5 @@
             "watchface": false
         }
     },
-    "version": "2.2.0"
+    "version": "3.0.0"
 }
