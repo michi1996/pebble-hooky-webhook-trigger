@@ -405,12 +405,6 @@ static void confirm_run(void) {
   send_trigger(number, s_confirm_id);
 }
 
-static void confirm_cancel(void) {
-  if (s_confirm_number == 0) return;
-  s_confirm_number = 0;
-  window_stack_pop(true);
-}
-
 static void confirm_select_handler(ClickRecognizerRef recognizer, void *context) {
   confirm_run();
 }
@@ -421,6 +415,12 @@ static void confirm_click_config_provider(void *context) {
 }
 
 #if defined(PBL_TOUCH)
+static void confirm_cancel(void) {
+  if (s_confirm_number == 0) return;
+  s_confirm_number = 0;
+  window_stack_pop(true);
+}
+
 // Two touch buttons at the bottom of the confirmation window: Cancel (left) and Run (right).
 // On round displays they are kept inside the circle.
 static GRect confirm_button_rect(GRect bounds, bool run) {
