@@ -112,7 +112,7 @@ var PAGE = `<!DOCTYPE html>
       <label class="switch"><input id="autoClose" type="checkbox"><i></i></label>
     </div>
     <div class="row">
-      <div class="grow"><div class="title">Sound feedback</div><div class="sub">Plays a sound on success and on error</div></div>
+      <div class="grow"><div class="title">Sound feedback</div><div class="sub">Plays a sound on success and on error (watches with a speaker only)</div></div>
       <label class="switch"><input id="sound" type="checkbox"><i></i></label>
     </div>
     <div class="row">
