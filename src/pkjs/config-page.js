@@ -197,6 +197,18 @@ var PAGE = `<!DOCTYPE html>
   </div>
   <p class="note">If a body is set and you add no Content-Type header, it is sent as application/json when it starts with { or [, otherwise as text/plain.</p>
 
+  <h2>Response</h2>
+  <div class="card">
+    <label class="field"><span>Show on watch</span><select id="fResponse">
+      <option value="status">Status only (Success / Error)</option>
+      <option value="text">Response text</option>
+      <option value="json">Value from a JSON response</option>
+    </select></label>
+    <label class="field" id="pathField"><span>JSON path</span><input id="fJsonPath" type="text" placeholder="state  or  attributes.temperature" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+    <label class="field" id="formatField"><span>Format (optional)</span><input id="fTemplate" type="text" placeholder="{value} &deg;C" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+  </div>
+  <p class="note" id="responseNote">The answer opens in a scrollable window on the watch (up to about 480 characters). In the format, {value} is replaced by the answer. On the watch, SELECT runs the webhook again to refresh.</p>
+
   <h2>Authentication</h2>
   <div class="card">
     <div class="row">
@@ -466,6 +478,10 @@ function syncEditVisibility() {
   show('descField', $('fShowDesc').checked);
   show('authFields', $('fUseAuth').checked);
   show('bodyField', $('fMethod').value !== 'GET');
+  var mode = $('fResponse').value;
+  show('pathField', mode === 'json');
+  show('formatField', mode !== 'status');
+  show('responseNote', mode !== 'status');
 }
 
 function openEdit(w, isNew, insertAfter) {
@@ -485,6 +501,9 @@ function openEdit(w, isNew, insertAfter) {
   $('fClientId').value = w.clientId || '';
   $('fClientSecret').value = w.clientSecret || '';
   $('fConfirm').checked = !!w.confirm;
+  $('fResponse').value = w.response === 'text' || w.response === 'json' ? w.response : 'status';
+  $('fJsonPath').value = w.jsonPath || '';
+  $('fTemplate').value = w.template || '';
   editingHeaders = (w.headers || []).map(function (h) { return { name: h.name, value: h.value }; });
   editingColor = w.color || '';
   $('urlErr').textContent = '';
@@ -534,6 +553,9 @@ function applyForm() {
   editing.clientSecret = $('fClientSecret').value.trim();
   editing.color = editingColor;
   editing.confirm = $('fConfirm').checked;
+  editing.response = $('fResponse').value;
+  editing.jsonPath = $('fJsonPath').value.trim();
+  editing.template = $('fTemplate').value;
   if (state.webhooks.indexOf(editing) === -1) {
     var after = editingInsertAfter ? state.webhooks.indexOf(editingInsertAfter) : -1;
     if (after === -1) state.webhooks.push(editing);
@@ -629,7 +651,10 @@ function normalizeImported(o) {
       clientId: str(w.clientId).trim(),
       clientSecret: str(w.clientSecret).trim(),
       color: hex(w.color, ''),
-      confirm: w.confirm === true
+      confirm: w.confirm === true,
+      response: (w.response === 'text' || w.response === 'json') ? w.response : 'status',
+      jsonPath: str(w.jsonPath).trim(),
+      template: str(w.template)
     });
   });
   return out;
@@ -686,7 +711,8 @@ METHODS.forEach(function (m) {
 
 $('addBtn').addEventListener('click', function () {
   openEdit({ id: newId(), name: '', desc: '', showDesc: true, url: '', method: 'POST', body: '',
-             headers: [], useAuth: false, clientId: '', clientSecret: '', color: '', confirm: false }, true);
+             headers: [], useAuth: false, clientId: '', clientSecret: '', color: '', confirm: false,
+             response: 'status', jsonPath: '', template: '' }, true);
 });
 $('addHdr').addEventListener('click', function () {
   editingHeaders.push({ name: '', value: '' });
@@ -711,6 +737,7 @@ $('darkList').addEventListener('change', function () { state.darkList = $('darkL
 $('fShowDesc').addEventListener('change', syncEditVisibility);
 $('fUseAuth').addEventListener('change', syncEditVisibility);
 $('fMethod').addEventListener('change', syncEditVisibility);
+$('fResponse').addEventListener('change', syncEditVisibility);
 $('fUrl').addEventListener('input', function () {
   $('urlErr').textContent = '';
   $('fUrl').classList.remove('bad');

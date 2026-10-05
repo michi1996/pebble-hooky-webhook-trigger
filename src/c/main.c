@@ -6,6 +6,8 @@
 #define KEY_COUNT 3
 #define KEY_ITEM_START 4
 #define KEY_TRIGGER_ID 5     // id of the triggered webhook, lets the phone find it even if the list changed
+#define KEY_RESPONSE 6       // response text to show (sent together with KEY_STATUS)
+#define KEY_RESPONSE_TITLE 7 // name of the webhook the response belongs to
 #define KEY_AUTO_CLOSE 30
 #define KEY_HEADER_COLOR 31
 #define KEY_HIGHLIGHT_COLOR 32
@@ -37,6 +39,7 @@
 
 #define TITLE_LEN 32
 #define DESC_LEN 40
+#define RESPONSE_LEN 512     // the phone sends at most 480 bytes
 
 // Third-party apps use the platform's default text size: "Large" on the big displays
 // (Pebble Time 2, Pebble Round 2) with 24px subtitles, "Medium" everywhere else (18px subtitles).
@@ -111,6 +114,17 @@ static char s_confirm_buf[TITLE_LEN + 16];
 #if defined(PBL_TOUCH)
 static Layer *s_confirm_buttons = NULL;
 #endif
+
+// response window (webhooks that show their answer)
+static Window *s_result_window = NULL;
+static Layer *s_result_header = NULL;
+static ScrollLayer *s_result_scroll = NULL;
+static TextLayer *s_result_text = NULL;
+static char s_result_buf[RESPONSE_LEN];
+static char s_result_title[TITLE_LEN];
+static GColor s_result_color;
+static uint16_t s_result_number = 0;   // webhook to run again with SELECT
+static int32_t s_result_id = 0;
 
 // ---------------------------------------------------------------- storage helpers
 
@@ -334,6 +348,9 @@ static void set_pending(uint8_t pending) {
   s_pending = pending;
   if (s_header_layer) {
     layer_mark_dirty(s_header_layer);
+  }
+  if (s_result_header) {
+    layer_mark_dirty(s_result_header);
   }
 }
 
@@ -801,6 +818,156 @@ static void copy_tuple_string(char *dst, size_t dst_size, const Tuple *t) {
   }
 }
 
+// ---------------------------------------------------------------- response window
+
+#define RESULT_HEADER_HEIGHT PBL_IF_ROUND_ELSE(46, 24)
+
+static void result_header_update_proc(Layer *layer, GContext *ctx) {
+  GRect bounds = layer_get_bounds(layer);
+  const char *title = s_pending > 0 ? "Updating..." : s_result_title;
+
+  graphics_context_set_fill_color(ctx, s_result_color);
+  graphics_fill_rect(ctx, bounds, 0, GCornerNone);
+#if defined(PBL_COLOR)
+  graphics_context_set_text_color(ctx, legible_over(s_result_color));
+#else
+  graphics_context_set_text_color(ctx, GColorWhite);
+#endif
+
+  #if defined(PBL_ROUND)
+    graphics_draw_text(ctx, title, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
+                       GRect(bounds.size.w / 4, bounds.size.h - 26, bounds.size.w / 2, 24),
+                       GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+  #else
+    graphics_draw_text(ctx, title, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
+                       GRect(6, 0, bounds.size.w - 12, 24), GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+  #endif
+}
+
+// Short single-line answers ("21.5 °C", "open") are shown big and centered
+static bool result_is_short(void) {
+  return strlen(s_result_buf) <= 18 && !strchr(s_result_buf, '\n');
+}
+
+static void result_layout(void) {
+  if (!s_result_window || !s_result_text || !s_result_scroll) return;
+
+  GRect frame = layer_get_frame(scroll_layer_get_layer(s_result_scroll));
+  bool big = result_is_short();
+  int16_t margin = PBL_IF_ROUND_ELSE(0, 6);   // round: the text flow keeps the text inside the circle
+  int16_t width = frame.size.w - 2 * margin;
+
+  const char *font_key = FONT_KEY_GOTHIC_28_BOLD;
+  if (!big) {
+#if PBL_DISPLAY_WIDTH >= 200
+    font_key = FONT_KEY_GOTHIC_24;
+#else
+    font_key = FONT_KEY_GOTHIC_18;
+#endif
+  }
+  text_layer_set_font(s_result_text, fonts_get_system_font(font_key));
+  text_layer_set_text_alignment(s_result_text, big ? GTextAlignmentCenter : PBL_IF_ROUND_ELSE(GTextAlignmentCenter, GTextAlignmentLeft));
+  text_layer_set_text(s_result_text, s_result_buf);
+
+  // Measure the text, then size the layer and the scroll area to it
+  layer_set_frame(text_layer_get_layer(s_result_text), GRect(margin, 0, width, 2000));
+  GSize size = text_layer_get_content_size(s_result_text);
+  size.h += 8;
+  int16_t top = 4;
+  if (big && size.h < frame.size.h) {
+    top = (frame.size.h - size.h) / 2 - 4;
+  }
+  layer_set_frame(text_layer_get_layer(s_result_text), GRect(margin, top, width, size.h));
+  scroll_layer_set_content_size(s_result_scroll, GSize(frame.size.w, top + size.h + 4));
+  scroll_layer_set_content_offset(s_result_scroll, GPointZero, false);
+}
+
+// SELECT runs the webhook again, the window updates when the answer arrives
+static void result_select_handler(ClickRecognizerRef recognizer, void *context) {
+  if (s_result_number == 0) return;
+  send_trigger(s_result_number, s_result_id);
+}
+
+static void result_click_config_provider(void *context) {
+  window_single_click_subscribe(BUTTON_ID_SELECT, result_select_handler);
+}
+
+static void result_window_load(Window *window) {
+  Layer *root = window_get_root_layer(window);
+  GRect bounds = layer_get_bounds(root);
+  int16_t header_height = RESULT_HEADER_HEIGHT;
+
+  s_result_scroll = scroll_layer_create(GRect(0, header_height, bounds.size.w, bounds.size.h - header_height));
+  scroll_layer_set_shadow_hidden(s_result_scroll, true);
+  scroll_layer_set_click_config_onto_window(s_result_scroll, window);
+  scroll_layer_set_callbacks(s_result_scroll, (ScrollLayerCallbacks){
+    .click_config_provider = result_click_config_provider
+  });
+  layer_add_child(root, scroll_layer_get_layer(s_result_scroll));
+
+  s_result_text = text_layer_create(GRect(0, 0, bounds.size.w, 2000));
+  text_layer_set_background_color(s_result_text, GColorClear);
+  text_layer_set_text_color(s_result_text, theme_fg());
+  text_layer_set_overflow_mode(s_result_text, GTextOverflowModeWordWrap);
+  scroll_layer_add_child(s_result_scroll, text_layer_get_layer(s_result_text));
+#if defined(PBL_ROUND)
+  text_layer_enable_screen_text_flow_and_paging(s_result_text, 4);
+  scroll_layer_set_paging(s_result_scroll, true);
+#endif
+
+  s_result_header = layer_create(GRect(0, 0, bounds.size.w, header_height));
+  layer_set_update_proc(s_result_header, result_header_update_proc);
+  layer_add_child(root, s_result_header);
+
+  result_layout();
+}
+
+static void result_window_unload(Window *window) {
+  if (s_result_text) {
+    text_layer_destroy(s_result_text);
+    s_result_text = NULL;
+  }
+  if (s_result_scroll) {
+    scroll_layer_destroy(s_result_scroll);
+    s_result_scroll = NULL;
+  }
+  if (s_result_header) {
+    layer_destroy(s_result_header);
+    s_result_header = NULL;
+  }
+  window_destroy(window);
+  s_result_window = NULL;
+}
+
+static void show_response(int32_t status, DictionaryIterator *iter) {
+  copy_tuple_string(s_result_buf, sizeof(s_result_buf), dict_find(iter, KEY_RESPONSE));
+  copy_tuple_string(s_result_title, sizeof(s_result_title), dict_find(iter, KEY_RESPONSE_TITLE));
+  if (s_result_title[0] == '\0') {
+    strncpy(s_result_title, "Hooky", sizeof(s_result_title) - 1);
+  }
+  Tuple *t_number = dict_find(iter, KEY_TRIGGER);
+  s_result_number = t_number ? (uint16_t)tuple_to_int32(t_number) : 0;
+  s_result_id = tuple_to_int32(dict_find(iter, KEY_TRIGGER_ID));
+  s_result_color = status == 200 ? POPUP_SUCCESS_COLOR : POPUP_WARNING_COLOR;
+  play_feedback_sound(status == 200);
+
+  if (s_result_window) {
+    // Refreshed with SELECT: update the open window
+    result_layout();
+    if (s_result_header) layer_mark_dirty(s_result_header);
+    return;
+  }
+
+  destroy_popup(false);
+  s_result_window = window_create();
+  window_set_background_color(s_result_window, theme_bg());
+  window_set_window_handlers(s_result_window, (WindowHandlers){
+    .load = result_window_load,
+    .unload = result_window_unload
+  });
+  window_stack_push(s_result_window, true);
+}
+
 static void handle_status(int32_t status) {
   static char buf[24];
 
@@ -822,6 +989,9 @@ static void handle_status(int32_t status) {
       break;
     case -2:
       show_result("Not found", POPUP_NEUTRAL_COLOR, false);
+      break;
+    case -3:
+      show_result("Bad response", POPUP_WARNING_COLOR, false);
       break;
     default:
       snprintf(buf, sizeof(buf), "Status %ld", (long)status);
@@ -903,7 +1073,14 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
 
   Tuple *tstatus = dict_find(iter, KEY_STATUS);
   if (tstatus) {
-    handle_status(tuple_to_int32(tstatus));
+    int32_t status = tuple_to_int32(tstatus);
+    if (dict_find(iter, KEY_RESPONSE)) {
+      APP_LOG(APP_LOG_LEVEL_INFO, "Webhook response received (status %ld)", (long)status);
+      request_finished();
+      show_response(status, iter);
+    } else {
+      handle_status(status);
+    }
     return;
   }
 }

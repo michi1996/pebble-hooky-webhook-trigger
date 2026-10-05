@@ -7,6 +7,8 @@ var KEY_STATUS = 2;          // result of a webhook call
 var KEY_COUNT = 3;           // number of webhooks in this sync
 var KEY_ITEM_START = 4;      // index of the first webhook in an item batch
 var KEY_TRIGGER_ID = 5;      // id hash of the triggered webhook (sent by the watch)
+var KEY_RESPONSE = 6;        // response text to show on the watch
+var KEY_RESPONSE_TITLE = 7;  // name of the webhook the response belongs to
 var KEY_AUTO_CLOSE = 30;
 var KEY_HEADER_COLOR = 31;
 var KEY_HIGHLIGHT_COLOR = 32;
@@ -22,10 +24,12 @@ var KEY_ID_BASE = 500;       // + slot inside a batch (id hash, lets the watch t
 var BATCH_SIZE = 6;          // must match ITEM_BATCH_SIZE in main.c
 var MAX_NAME_BYTES = 31;     // watch buffer: 32
 var MAX_DESC_BYTES = 39;     // watch buffer: 40
+var MAX_RESPONSE_BYTES = 480; // watch buffer: 512
 
 var DEFAULT_HEADER_COLOR = '#0055AA';
 var DEFAULT_HIGHLIGHT_COLOR = '#00FFFF';
 var METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'];
+var RESPONSE_MODES = ['status', 'text', 'json'];   // what the watch shows after a successful call
 var REQUEST_TIMEOUT_MS = 10000;
 
 var STORAGE_KEY = 'hooky-config';
@@ -88,7 +92,8 @@ function truncateUtf8(str, maxBytes) {
 // {
 //   version: 3, autoClose, soundFeedback, touchEnabled, darkList, headerColor, highlightColor,
 //   webhooks: [{ id, name, desc, showDesc, url, method, body, headers: [{name, value}],
-//                useAuth, clientId, clientSecret, color, confirm }]
+//                useAuth, clientId, clientSecret, color, confirm,
+//                response: 'status' | 'text' | 'json', jsonPath, template }]
 // }
 // Older configs (version 2) are upgraded automatically by filling in defaults.
 function sanitizeConfig(raw) {
@@ -141,7 +146,10 @@ function sanitizeConfig(raw) {
       clientId: asString(w.clientId).trim(),
       clientSecret: asString(w.clientSecret).trim(),
       color: asColor(w.color, ''),
-      confirm: asBool(w.confirm)
+      confirm: asBool(w.confirm),
+      response: RESPONSE_MODES.indexOf(asString(w.response)) === -1 ? 'status' : asString(w.response),
+      jsonPath: asString(w.jsonPath).trim(),
+      template: asString(w.template)
     });
   });
   return cfg;
@@ -253,9 +261,15 @@ function sendSettingsToWatch(cfg) {
   sendSequentially(buildSyncMessages(cfg), syncGeneration);
 }
 
-function sendStatus(code) {
+// extra: optional additional keys (e.g. the response text)
+function sendStatus(code, extra) {
   var msg = {};
   msg[KEY_STATUS] = code;
+  if (extra) {
+    for (var key in extra) {
+      if (extra.hasOwnProperty(key)) msg[key] = extra[key];
+    }
+  }
   var attempts = 0;
   function send() {
     Pebble.sendAppMessage(msg, function () {}, function (e) {
@@ -320,6 +334,77 @@ function readPayload(payload, key, name) {
   return undefined;
 }
 
+// --- Response shown on the watch
+// Plain text of a response; HTML is reduced to its text.
+function cleanText(raw) {
+  var s = asString(raw);
+  if (/^\s*</.test(s)) {
+    s = s.replace(/<(script|style)[^>]*>[\s\S]*?<\/\1>/gi, ' ')
+         .replace(/<br\s*\/?>/gi, '\n')
+         .replace(/<\/(p|div|li|tr|h[1-6])>/gi, '\n')
+         .replace(/<[^>]*>/g, ' ')
+         .replace(/&nbsp;/g, ' ').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+         .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&');
+  }
+  return s.replace(/\r\n?/g, '\n')
+          .replace(/[ \t]+/g, ' ')
+          .replace(/ ?\n ?/g, '\n')
+          .replace(/\n{3,}/g, '\n\n')
+          .trim();
+}
+
+// Reads a value like "state", "attributes.temperature" or "items[0].name"
+function readJsonPath(data, path) {
+  var parts = asString(path).replace(/\[(\d+)\]/g, '.$1').split('.');
+  var value = data;
+  for (var i = 0; i < parts.length; i++) {
+    if (parts[i] === '') continue;
+    if (value === null || typeof value !== 'object' || !(parts[i] in value)) return undefined;
+    value = value[parts[i]];
+  }
+  return value;
+}
+
+function valueToText(value) {
+  if (typeof value === 'string') return value;
+  if (value === null) return 'null';
+  if (typeof value === 'object') return JSON.stringify(value);
+  return String(value);
+}
+
+// Builds the text for the watch. Returns { ok, text }; ok is false when the
+// response does not contain what the webhook is configured to show.
+function formatResponse(hook, raw) {
+  var value;
+  if (hook.response === 'json') {
+    var data;
+    try {
+      data = JSON.parse(raw);
+    } catch (err) {
+      return { ok: false, text: 'The response is not JSON.' };
+    }
+    var picked = hook.jsonPath ? readJsonPath(data, hook.jsonPath) : data;
+    if (typeof picked === 'undefined') {
+      return { ok: false, text: '"' + hook.jsonPath + '" not found in the response.' };
+    }
+    value = valueToText(picked);
+  } else {
+    value = cleanText(raw);
+  }
+
+  // Format: "{value}" is replaced by the value, "\n" starts a new line
+  var template = asString(hook.template).replace(/\\n/g, '\n');
+  if (template.trim()) {
+    value = template.indexOf('{value}') !== -1 ? template.split('{value}').join(value) : template + ' ' + value;
+  }
+  value = value.trim() || '(empty response)';
+
+  if (truncateUtf8(value, MAX_RESPONSE_BYTES) !== value) {
+    value = truncateUtf8(value, MAX_RESPONSE_BYTES - 3) + '\u2026';
+  }
+  return { ok: true, text: value };
+}
+
 function callWebhook(hook, index) {
   var method = hook.method || 'POST';
   var finished = false;
@@ -327,12 +412,22 @@ function callWebhook(hook, index) {
   var xhr;
 
   // Every request ends with exactly one status message to the watch
-  function finish(code, reason) {
+  function finish(code, reason, responseText) {
     if (finished) return;
     finished = true;
     if (timer) clearTimeout(timer);
     console.log('Webhook ' + index + ' finished: ' + reason);
-    sendStatus(code);
+    if (typeof responseText !== 'string') {
+      sendStatus(code);
+      return;
+    }
+    // The watch shows the text in a window that can run the webhook again (SELECT)
+    var extra = {};
+    extra[KEY_RESPONSE] = responseText;
+    extra[KEY_RESPONSE_TITLE] = truncateUtf8(hook.name || ('Webhook ' + index), MAX_NAME_BYTES);
+    extra[KEY_TRIGGER] = index;
+    extra[KEY_TRIGGER_ID] = idHash(hook.id);
+    sendStatus(code, extra);
   }
 
   console.log('Triggering webhook', index, hook.name, method);
@@ -377,7 +472,14 @@ function callWebhook(hook, index) {
     // Treat every 2xx answer (200, 201, 204, ...) as success.
     var onDone = function () {
       if (xhr.readyState !== 4 || !xhr.status) return;   // status 0 = network error, see onerror
-      finish((xhr.status >= 200 && xhr.status < 300) ? 200 : xhr.status, 'HTTP ' + xhr.status);
+      if (xhr.status < 200 || xhr.status >= 300) {
+        finish(xhr.status, 'HTTP ' + xhr.status);
+      } else if (hook.response === 'text' || hook.response === 'json') {
+        var result = formatResponse(hook, xhr.responseText);
+        finish(result.ok ? 200 : -3, 'HTTP ' + xhr.status + (result.ok ? '' : ', ' + result.text), result.text);
+      } else {
+        finish(200, 'HTTP ' + xhr.status);
+      }
     };
     xhr.onload = onDone;
     xhr.onreadystatechange = onDone;   // for engines without onload
@@ -418,7 +520,7 @@ Pebble.addEventListener('appmessage', function (e) {
     console.log('Missing URL for webhook', index);
     sendStatus(0);
   } else {
-    callWebhook(hook, index);
+    callWebhook(hook, cfg.webhooks.indexOf(hook) + 1);
   }
 
   // The watch shows an outdated list: send the current one
